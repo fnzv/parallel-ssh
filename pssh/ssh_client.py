@@ -19,19 +19,15 @@
 """Package containing SSHClient class."""
 
 import sys
-if 'threading' in sys.modules:
-    del sys.modules['threading']
-import gevent
-from gevent import monkey
-monkey.patch_all()
-import logging
+from gevent import sleep
 import paramiko
+from paramiko.ssh_exception import ChannelException as channel_exception
 import os
 from socket import gaierror as sock_gaierror, error as sock_error
 from .exceptions import UnknownHostException, AuthenticationException, \
      ConnectionErrorException, SSHException
 from .constants import DEFAULT_RETRIES
-
+import logging
 
 host_logger = logging.getLogger('pssh.host_logger')
 logger = logging.getLogger(__name__)
@@ -45,8 +41,8 @@ class SSHClient(object):
     def __init__(self, host,
                  user=None, password=None, port=None,
                  pkey=None, forward_ssh_agent=True,
-                 num_retries=DEFAULT_RETRIES, _agent=None, timeout=10,
-                 proxy_host=None, proxy_port=22):
+                 num_retries=DEFAULT_RETRIES, agent=None, timeout=10,
+                 proxy_host=None, proxy_port=22, channel_timeout=None):
         """Connect to host honouring any user set configuration in ~/.ssh/config \
         or /etc/ssh/ssh_config
         
@@ -73,17 +69,20 @@ class SSHClient(object):
         equivalent to `ssh -A` from the `ssh` command line utility. \
         Defaults to True if not set.
         :type forward_ssh_agent: bool
-        :param _agent: (Optional) Override SSH agent object with the provided. \
+        :param agent: (Optional) Override SSH agent object with the provided. \
         This allows for overriding of the default paramiko behaviour of \
-        connecting to local SSH agent to lookup keys with our own SSH agent. \
-        Only really useful for testing, hence the internal variable prefix.
-        :type _agent: :mod:`paramiko.agent.Agent`
+        connecting to local SSH agent to lookup keys with our own SSH agent \
+        object.
+        :type agent: :mod:`paramiko.agent.Agent`
         :param proxy_host: (Optional) SSH host to tunnel connection through \
         so that SSH clients connects to self.host via client -> proxy_host -> host
         :type proxy_host: str
         :param proxy_port: (Optional) SSH port to use to login to proxy host if \
         set. Defaults to 22.
         :type proxy_port: int
+        :param channel_timeout: (Optional) Time in seconds before an SSH operation \
+        times out.
+        :type channel_timeout: int
         """
         ssh_config = paramiko.SSHConfig()
         _ssh_config_file = os.path.sep.join([os.path.expanduser('~'),
@@ -108,10 +107,11 @@ class SSHClient(object):
         self.pkey = pkey
         self.port = port if port else 22
         self.host = resolved_address
-        if _agent:
-            self.client._agent = _agent
+        if agent:
+            self.client._agent = agent
         self.num_retries = num_retries
         self.timeout = timeout
+        self.channel_timeout = channel_timeout
         self.proxy_host, self.proxy_port = proxy_host, proxy_port
         self.proxy_client = None
         if self.proxy_host and self.proxy_port:
@@ -120,7 +120,7 @@ class SSHClient(object):
             self._connect_tunnel()
         else:
             self._connect(self.client, self.host, self.port)
-
+    
     def _connect_tunnel(self):
         """Connects to SSH server via an intermediate SSH tunnel server.
         client (me) -> tunnel (ssh server to proxy through) -> \
@@ -134,11 +134,18 @@ class SSHClient(object):
         self._connect(self.proxy_client, self.proxy_host, self.proxy_port)
         logger.info("Connecting via SSH proxy %s:%s -> %s:%s", self.proxy_host,
                     self.proxy_port, self.host, self.port,)
-        proxy_channel = self.proxy_client.get_transport().\
-          open_channel('direct-tcpip', (self.host, self.port,),
-                       ('127.0.0.1', 0))
-        return self._connect(self.client, self.host, self.port, sock=proxy_channel)
-        
+        try:
+          proxy_channel = self.proxy_client.get_transport().\
+            open_channel('direct-tcpip', (self.host, self.port,),
+                        ('127.0.0.1', 0))
+          sleep(0)
+          return self._connect(self.client, self.host, self.port, sock=proxy_channel)
+        except channel_exception, ex:
+          error_type = ex.args[1] if len(ex.args) > 1 else ex.args[0]
+          raise ConnectionErrorException("Error connecting to host '%s:%s' - %s",
+                                           self.host, self.port,
+                                           str(error_type))
+    
     def _connect(self, client, host, port, sock=None, retries=1):
         """Connect to host
         
@@ -156,7 +163,7 @@ class SSHClient(object):
             logger.error("Could not resolve host '%s' - retry %s/%s",
                          self.host, retries, self.num_retries)
             while retries < self.num_retries:
-                gevent.sleep(5)
+                sleep(5)
                 return self._connect(client, host, port, sock=sock,
                                      retries=retries+1)
             raise UnknownHostException("Unknown host %s - %s - retry %s/%s",
@@ -166,7 +173,7 @@ class SSHClient(object):
             logger.error("Error connecting to host '%s:%s' - retry %s/%s",
                          self.host, self.port, retries, self.num_retries)
             while retries < self.num_retries:
-                gevent.sleep(5)
+                sleep(5)
                 return self._connect(client, host, port, sock=sock,
                                      retries=retries+1)
             error_type = ex.args[1] if len(ex.args) > 1 else ex.args[0]
@@ -174,7 +181,7 @@ class SSHClient(object):
                                            self.host, self.port,
                                            str(error_type), retries, self.num_retries,)
         except paramiko.AuthenticationException, ex:
-            msg = "Host is '%s:%s'"
+            msg = "Authentication error while connecting to %s:%s."
             raise AuthenticationException(msg, host, port)
         # SSHException is more general so should be below other types
         # of SSH failure
@@ -183,12 +190,13 @@ class SSHClient(object):
             logger.error(msg)
             raise SSHException(msg, host, port)
 
-    def exec_command(self, command, sudo=False, user=None, **kwargs):
+    def exec_command(self, command, sudo=False, user=None,
+                     shell=None,
+                     use_shell=True, **kwargs):
         """Wrapper to :mod:`paramiko.SSHClient.exec_command`
         
-        Opens a new SSH session with a new pty and runs command with given \
-        `kwargs` if any. Greenlet then yields (sleeps) while waiting for \
-        command to finish executing or channel to close indicating the same.
+        Opens a new SSH session with a new pty and runs command before yielding 
+        the main gevent loop to allow other greenlets to execute.
         
         :param command: Shell command to execute
         :type command: str
@@ -206,32 +214,35 @@ class SSHClient(object):
         if self.forward_ssh_agent:
             agent_handler = paramiko.agent.AgentRequestHandler(channel)
         channel.get_pty()
-        # if self.timeout:
-        #     channel.settimeout(self.timeout)
+        if self.channel_timeout:
+            channel.settimeout(self.channel_timeout)
         _stdout, _stderr = channel.makefile('rb'), \
                            channel.makefile_stderr('rb')
         stdout, stderr = self._read_output_buffer(_stdout,), \
                          self._read_output_buffer(_stderr,
                                                   prefix='\t[err]')
+        for _char in ['\\', '"', '$', '`']:
+            command = command.replace(_char, '\%s' % (_char,))
+        shell = '$SHELL -c' if not shell else shell
+        _command = ''
         if sudo and not user:
-            command = 'sudo -S bash -c \'%s\'' % (command,)
+            _command = 'sudo -S '
         elif user:
-            command = 'sudo -u %s -S bash -c \'%s\'' % (
-                user, command,)
+            _command = 'sudo -u %s -S ' % (user,)
+        if use_shell:
+            _command += '%s "%s"' % (shell, command,)
         else:
-            command = 'bash -c \'%s\'' % (command,)
-        logger.debug("Running command %s on %s", command, self.host)
-        channel.exec_command(command, **kwargs)
+            _command += '"%s"' % (command,)
+        logger.debug("Running parsed command %s on %s", _command, self.host)
+        channel.exec_command(_command, **kwargs)
         logger.debug("Command started")
-        while not (channel.recv_ready() or channel.closed or
-                   channel.exit_status_ready()):
-            gevent.sleep(.2)
+        sleep(0)
         return channel, self.host, stdout, stderr
 
     def _read_output_buffer(self, output_buffer, prefix=''):
         """Read from output buffers and log to host_logger"""
         for line in output_buffer:
-            output = line.strip()
+            output = line.strip().decode('utf8')
             host_logger.info("[%s]%s\t%s", self.host, prefix, output,)
             yield output
 
@@ -385,8 +396,7 @@ class SSHClient(object):
             logger.info("Copied local file %s from remote destination %s:%s",
                         local_file, self.host, remote_file)
 
-    @staticmethod
-    def _parent_path_split(file_path):
+    def _parent_path_split(self, file_path):
         try:
             destination = [_dir for _dir in file_path.split(os.path.sep)
                             if _dir][:-1][0]
