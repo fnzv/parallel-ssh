@@ -322,6 +322,8 @@ class SSHClient(object):
         
         :raises: :mod:`ValueError` when a directory is supplied to local_file \
         and recurse is not set
+        :raises: :mod:`OSError` on OS errors creating directories or file
+        :raises: :mod:`IOError` on IO errors creating directories or file
         """
         if os.path.isdir(local_file) and recurse:
             return self._copy_dir(local_file, remote_file)
@@ -340,6 +342,7 @@ class SSHClient(object):
         except Exception, error:
             logger.error("Error occured copying file %s to remote destination %s:%s - %s",
                          local_file, self.host, remote_file, error)
+            raise error
         else:
             logger.info("Copied local file %s to remote destination %s:%s",
                         local_file, self.host, remote_file)
@@ -366,35 +369,44 @@ class SSHClient(object):
         :param recurse: Whether or not to recursively copy directories.
         :type recurse: bool
 
-        :raises: :mod:'ValueError' when a directory is supplied to remote_file \
+        :raises: :mod:`ValueError` when a directory is supplied to remote_file \
         and recurse is not set
+        :raises: :mod:`OSError` on OS errors creating directories or file
+        :raises: :mod:`IOError` on IO errors creating directories or file
         """
         sftp = self._make_sftp()
         try:
             sftp.listdir(remote_file)
-            remote_dir_exists = True
-        except IOError or OSError:
+        except (OSError, IOError):
             remote_dir_exists = False
+        else:
+            remote_dir_exists = True
         if remote_dir_exists and recurse:
             return self._copy_dir_to_local(remote_file, local_file)
         elif remote_dir_exists and not recurse:
             raise ValueError("Recurse must be true if remote_file is a "
                              "directory.")
         destination = self._parent_path_split(local_file)
-        if not os.path.exists(destination):
-            try:
-                os.makedirs(destination)
-            except OSError:
-                logger.error("Unable to create local directory structure.")
-                raise
+        self._make_local_dir(destination)
         try:
+            import ipdb; ipdb.set_trace()
             sftp.get(remote_file, local_file)
         except Exception, error:
             logger.error("Error occured copying file %s from remote destination %s:%s - %s",
                          local_file, self.host, remote_file, error)
+            raise error
         else:
             logger.info("Copied local file %s from remote destination %s:%s",
                         local_file, self.host, remote_file)
+
+    def _make_local_dir(self, dirpath):
+        if not os.path.exists(dirpath):
+            try:
+                os.makedirs(dirpath)
+            except OSError:
+                logger.error("Unable to create local directory structure for "
+                             "directory %s", dirpath)
+                raise
 
     def _parent_path_split(self, file_path):
         try:
